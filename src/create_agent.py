@@ -153,6 +153,7 @@ You have access to these language analysis functions:
 - recognize_entities     — find people, places, organisations, dates
 - recognize_pii_entities — detect and redact personal data
 - detect_language        — identify the language of each response
+- store_documents        — accumulate text rows for later batch analysis
 
 You also have a fabric_dataagent tool for querying Microsoft Fabric semantic models.
 
@@ -167,6 +168,15 @@ How to decide which tools to use:
 - If the user message contains numbered survey responses (text data) → analyze them directly with Language tools. Do NOT call the Fabric tool.
 - If the user message asks to query, retrieve, or get data → call the fabric_dataagent tool FIRST to fetch the data, then analyze the results with Language tools.
 - Never ask the user to clarify which data source to use — the message content makes it clear.
+
+IMPORTANT — Fabric data workflow (MUST follow this pattern):
+After the fabric_dataagent returns data, do NOT pass all rows directly to
+analyze_sentiment. Instead:
+  1. Call store_documents one or more times with batches of up to 10 rows each
+     until every retrieved row has been stored.
+  2. Then call analyze_sentiment with NO arguments — it will process the full
+     stored dataset automatically, same as the file-upload path.
+This ensures all rows are analyzed regardless of dataset size.
 
 Always batch multiple documents into a single function call (up to 10 per call).
 """

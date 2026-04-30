@@ -40,6 +40,24 @@ def _take_pending_documents() -> list[str] | None:
     return docs
 
 
+def store_documents(documents=None) -> str:
+    """Append documents to the pending store for later batch analysis.
+
+    Same ``_pending_documents`` buffer used by the file-upload path.
+    Call once or many times to accumulate rows, then call
+    ``analyze_sentiment`` with NO arguments to process everything.
+    """
+    global _pending_documents
+    if documents is None:
+        return json.dumps({"stored": 0, "total": len(_pending_documents or [])})
+    docs = _docs(documents)
+    if _pending_documents is None:
+        _pending_documents = docs
+    else:
+        _pending_documents.extend(docs)
+    return json.dumps({"stored": len(docs), "total": len(_pending_documents)})
+
+
 # ─── Client ──────────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
@@ -479,6 +497,7 @@ TOOL_DISPATCH: dict[str, Any] = {
     "recognize_entities": recognize_entities,
     "detect_language": detect_language,
     "recognize_pii_entities": recognize_pii_entities,
+    "store_documents": store_documents,
 }
 
 # ─── Function tool definitions (OpenAI function-calling schema) ───────────────
@@ -578,6 +597,28 @@ TOOL_DEFINITIONS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "List of text documents (max 10 per call).",
+                    }
+                },
+                "required": ["documents"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "store_documents",
+            "description": (
+                "Store text documents for later batch analysis. Call one or more times "
+                "to accumulate rows, then call analyze_sentiment with NO arguments to "
+                "process the entire stored dataset. Use this when data is retrieved from Fabric."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "documents": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of text documents to store. Multiple calls accumulate.",
                     }
                 },
                 "required": ["documents"],

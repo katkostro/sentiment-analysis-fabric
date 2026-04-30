@@ -98,6 +98,51 @@ def _load_dataframe(file_bytes: bytes) -> "pd.DataFrame":
     raise ValueError("Could not open file." + drm_hint)
 
 
+def _extract_fabric_rows(reply: str) -> list[str]:
+    """Parse text rows from the agent's Fabric data-fetch response.
+
+    Handles common formats returned by the LLM:
+      - Numbered lines:  1. Some text  /  1) Some text
+      - Bullet lines:    - Some text  /  * Some text
+      - Pipe-delimited table rows (skip headers/separators)
+      - Plain non-empty lines as fallback
+    """
+    lines = reply.strip().splitlines()
+    rows: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip markdown table separators (|---|---|)
+        if re.match(r"^\|[\s\-|]+\|$", stripped):
+            continue
+        # Skip lines that look like headers or labels
+        if stripped.startswith("#") or stripped.startswith("**"):
+            continue
+        # Numbered list: "1. text" or "1) text"
+        m = re.match(r"^\d+[\.\)]\s+(.+)", stripped)
+        if m:
+            rows.append(m.group(1).strip())
+            continue
+        # Bullet list
+        m = re.match(r"^[-\*•]\s+(.+)", stripped)
+        if m:
+            rows.append(m.group(1).strip())
+            continue
+        # Pipe-delimited table row — take the longest cell as the text
+        if "|" in stripped:
+            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            # Skip if all cells look like numbers/headers
+            text_cells = [c for c in cells if len(c) > 10 and not re.match(r"^[\d\.\-\s%]+$", c)]
+            if text_cells:
+                rows.append(max(text_cells, key=len))
+                continue
+        # Fallback: any line with enough text content
+        if len(stripped) > 15:
+            rows.append(stripped)
+    return rows
+
+
 def _guess_text_column(df: "pd.DataFrame") -> str:
     """Pick the most likely free-text response column."""
     # 1. Column name matches a known keyword and NOT a skip pattern
@@ -520,22 +565,10 @@ def main() -> None:
             st.session_state["_pending_file_msg"] = user_msg
             st.rerun()
 
-        # Fabric query mode — agent calls Fabric Data Agent tool directly
+        # Fabric query mode — two-phase: fetch data, then analyze via same path as file upload
         if data_source == "Fabric Semantic Model" and fabric_query and st.button("Query & Analyze", type="primary", use_container_width=True):
-            user_msg = (
-                f"Use the fabric_dataagent tool now to query the semantic model: {fabric_query}\n\n"
-                "After retrieving the data, analyze it using the Language tools "
-                "(analyze_sentiment, extract_key_phrases, recognize_entities — batch up to 10 per call).\n\n"
-                "Present results in this structure:\n"
-                "1. Customer Sentiment Overview (executive summary)\n"
-                "2. Where Sentiment Breaks Down (table with themes and sentiment percentages)\n"
-                "3. Key Drivers of Negative Sentiment (table with top 5 issue clusters)\n"
-                "4. Key Drivers of Positive Sentiment (table with top strengths)\n"
-                "5. Insight-Driven Recommendations (numbered, with Why/Recommendation format)"
-            )
-            
             st.session_state.messages.append({"role": "user", "content": f"Query: {fabric_query}"})
-            st.session_state["_pending_fabric_msg"] = user_msg
+            st.session_state["_pending_fabric_query"] = fabric_query
             st.rerun()
 
         st.divider()
@@ -586,12 +619,51 @@ def main() -> None:
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
-    # ── Run Fabric query (outside sidebar) ────────────────────────────────
-    if st.session_state.get("_pending_fabric_msg"):
-        user_msg = st.session_state.pop("_pending_fabric_msg")
+    # ── Run Fabric query (two-phase: fetch → extract → analyze) ────────────
+    if st.session_state.get("_pending_fabric_query"):
+        fabric_query = st.session_state.pop("_pending_fabric_query")
         with st.chat_message("assistant"):
-            with st.status("Starting Foundry Agent...", expanded=True) as status:
-                reply = send_message(client, config["agent_id"], st.session_state.thread_id, user_msg, status_widget=status, task="fabric")
+            with st.status("Querying Fabric...", expanded=True) as status:
+                # Phase 1: Ask agent to fetch data from Fabric only
+                fetch_msg = (
+                    f"Use the fabric_dataagent tool to query the semantic model: {fabric_query}\n\n"
+                    "Return ALL the retrieved rows as a numbered list. Do NOT call any analysis tools yet."
+                )
+                status.update(label="Foundry Agent → Fabric Agent: querying data...", state="running")
+                fetch_reply = send_message(
+                    client, config["agent_id"], st.session_state.thread_id,
+                    fetch_msg, status_widget=status, task="fabric",
+                )
+
+                # Phase 2: Extract rows from the agent's reply in Python
+                status.update(label="Extracting rows from Fabric response...", state="running")
+                rows = _extract_fabric_rows(fetch_reply)
+                if not rows:
+                    st.warning("Could not extract any rows from the Fabric response.")
+                    st.markdown(fetch_reply)
+                    st.session_state.messages.append({"role": "assistant", "content": fetch_reply})
+                    st.rerun()
+
+                # Phase 3: Same path as file upload — store in buffer, analyze
+                from language_tools import set_pending_documents
+                set_pending_documents(rows)
+
+                analyze_msg = (
+                    f"Fabric returned **{len(rows)} responses**. The data is now loaded.\n\n"
+                    "Call analyze_sentiment with NO arguments so it uses the full dataset.\n"
+                    "Do NOT use extract_key_phrases or recognize_entities unless explicitly requested.\n\n"
+                    "Present results in this structure:\n"
+                    "1. Customer Sentiment Overview (executive summary)\n"
+                    "2. Where Sentiment Breaks Down (table with themes and sentiment percentages)\n"
+                    "3. Key Drivers of Negative Sentiment (table with top 5 issue clusters)\n"
+                    "4. Key Drivers of Positive Sentiment (table with top strengths)\n"
+                    "5. Insight-Driven Recommendations (numbered, with Why/Recommendation format)"
+                )
+                status.update(label=f"Analyzing {len(rows)} rows...", state="running")
+                reply = send_message(
+                    client, config["agent_id"], st.session_state.thread_id,
+                    analyze_msg, status_widget=status, task="file",
+                )
             st.markdown(reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
